@@ -1,0 +1,7 @@
+.env
+backups/**/*
+config/**/*
+logs/**/*
+secrets/**/*
+!**/.gitkeep
+.vscode/

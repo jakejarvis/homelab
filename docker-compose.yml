@@ -1,0 +1,570 @@
+version: "3"
+
+services:
+  traefik:
+    image: docker.io/traefik:2.10
+    restart: unless-stopped
+    command:
+      - --global.sendanonymoususage=false
+      - --global.checknewversion=false
+      - --api=true
+      - --api.dashboard=true
+      # - --api.insecure=true
+      - --log=true
+      - --log.level=INFO
+      - --accesslog=true
+      - --accesslog.filters.statusCodes=400-499,500-599
+      - --accesslog.filters.retryAttempts=true
+      - --accesslog.bufferingsize=100
+      - --ping=true
+      - --entrypoints.web=true
+      - --entrypoints.web.address=:80
+      - --entrypoints.web.proxyProtocol.insecure=true
+      - --entrypoints.web.forwardedHeaders.insecure=true
+      - --serversTransport.insecureSkipVerify=true
+      - --serversTransport.forwardingTimeouts.dialTimeout=0
+      - --providers.docker=true
+      - --providers.docker.exposedByDefault=false
+      - --providers.docker.allowEmptyServices=false
+      - --providers.file=true
+      - --providers.file.directory=/config/dynamic
+      - --providers.file.watch=true
+    ports:
+      - 80:80
+    volumes:
+      - ${CONFIG_DIR}/traefik:/config
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    environment:
+      TZ: ${TZ}
+      EXTERNAL_DOMAIN: ${EXTERNAL_DOMAIN}
+    extra_hosts:
+      # allow this container to proxy services running on the host machine
+      # https://stackoverflow.com/a/24326540/1438024
+      - host.docker.internal:host-gateway
+    healthcheck:
+      test: ["CMD", "traefik", "healthcheck", "--ping"]
+    labels:
+      traefik.enable: true
+      # https://doc.traefik.io/traefik/operations/dashboard/#dashboard-router-rule
+      traefik.http.routers.dashboard.rule: Host(`traefik.${EXTERNAL_DOMAIN}`)
+      traefik.http.routers.dashboard.entrypoints: web
+      traefik.http.routers.dashboard.middlewares: auth@file
+      traefik.http.routers.dashboard.service: api@internal
+
+  authelia:
+    image: ghcr.io/authelia/authelia:master
+    restart: unless-stopped
+    depends_on:
+      - authelia_redis
+      - authelia_db
+    volumes:
+      - ${CONFIG_DIR}/authelia/app:/config
+    environment:
+      TZ: ${TZ}
+      PUID: ${UID:-1000}
+      PGID: ${GID:-1000}
+      # https://www.authelia.com/configuration/methods/environment/#environment-variables
+      AUTHELIA_DEFAULT_REDIRECTION_URL: https://${EXTERNAL_DOMAIN}
+      AUTHELIA_SESSION_DOMAIN: ${EXTERNAL_DOMAIN}
+      AUTHELIA_TOTP_ISSUER: ${EXTERNAL_DOMAIN}
+      # https://www.authelia.com/configuration/methods/secrets/#environment-variables
+      AUTHELIA_SESSION_SECRET: ${AUTHELIA_SESSION_SECRET:-unsecure_session_secret}
+      AUTHELIA_JWT_SECRET: ${AUTHELIA_JWT_SECRET:-v3ry_important_s3cr3t}
+      AUTHELIA_STORAGE_ENCRYPTION_KEY: ${AUTHELIA_STORAGE_ENCRYPTION_KEY:-you_must_generate_a_random_string_of_more_than_twenty_chars_and_configure_this}
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--server-response", "http://localhost:9091/api/health", "-O", "/dev/null"]
+    labels:
+      traefik.enable: true
+      traefik.http.routers.authelia.rule: Host(`auth.${EXTERNAL_DOMAIN}`)
+      traefik.http.routers.authelia.entrypoints: web
+      traefik.http.routers.authelia.middlewares: noauth@file
+      traefik.http.services.authelia.loadBalancer.server.port: 9091
+      # ---
+      com.centurylinklabs.watchtower.enable: true
+      com.centurylinklabs.watchtower.scope: ${COMPOSE_PROJECT_NAME:-lab}
+
+  authelia_redis:
+    image: docker.io/redis:7-alpine
+    restart: unless-stopped
+    user: ${UID:-1000}:${GID:-1000}
+    volumes:
+      - ${CONFIG_DIR}/authelia/redis:/data
+    environment:
+      TZ: ${TZ}
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+
+  authelia_db:
+    image: docker.io/postgres:16.1-alpine
+    restart: unless-stopped
+    user: ${UID:-1000}:${GID:-1000}
+    volumes:
+      - ${CONFIG_DIR}/authelia/db:/var/lib/postgresql/data
+    environment:
+      TZ: ${TZ}
+      POSTGRES_DB: authelia
+      POSTGRES_PASSWORD: authelia
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "postgres"]
+
+  # tldr: the network stacks of the VPN-connected containers essentially become this container's (e.g. sonarr's
+  # frontend moves from http://sonarr:8989 to http://wireguard:8989). if these services want to talk to each other,
+  # they act like they are all on the same machine (e.g. prowlarr connects to sonarr at http://localhost:8989).
+  wireguard:
+    image: ghcr.io/linuxserver/wireguard:latest
+    restart: unless-stopped
+    cap_add:
+      - NET_ADMIN
+      - SYS_MODULE
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    sysctls:
+      net.ipv4.conf.all.src_valid_mark: "1"
+      net.ipv4.conf.all.rp_filter: "2"
+      net.ipv6.conf.all.disable_ipv6: "0"
+    volumes:
+      - ${CONFIG_DIR}/wireguard/mullvad/${VPN_MULLVAD_SERVER}.conf:/config/wg_confs/wg0.conf:ro
+      - /lib/modules:/lib/modules
+    environment:
+      TZ: ${TZ}
+      PUID: ${UID:-1000}
+      PGID: ${GID:-1000}
+    extra_hosts:
+      # required for *arr apps to communicate with plex on a different machine
+      - plex:${NAS_IP:-127.0.0.1}
+    secrets:
+      - wg_private_key
+    healthcheck:
+      # compares VPN_MULLVAD_SERVER to the exit server we're actually connected to according to the am.i.mullvad.net API
+      test: ["CMD-SHELL", "curl --fail --silent https://am.i.mullvad.net/json | jq -ec 'select(.mullvad_exit_ip_hostname? == \"${VPN_MULLVAD_SERVER}\")'"]
+      retries: 3
+      interval: 1m30s
+      timeout: 10s
+
+  qbittorrent:
+    image: ghcr.io/linuxserver/qbittorrent:latest
+    restart: unless-stopped
+    sysctls:
+      net.ipv6.conf.all.disable_ipv6: "0"
+    network_mode: service:wireguard
+    volumes:
+      - ${CONFIG_DIR}/qbittorrent:/config
+      - ${LOGS_DIR}/qbittorrent:/logs
+      - downloads:/downloads
+    environment:
+      TZ: ${TZ}
+      PUID: ${UID:-1000}
+      PGID: ${GID:-1000}
+      WEBUI_PORT: 9393
+    healthcheck:
+      test: ["CMD", "qbt", "server", "info", "--url", "http://localhost:9393", "--password", ""]
+    labels:
+      traefik.enable: true
+      traefik.http.routers.qbittorrent.rule: Host(`qbit.${EXTERNAL_DOMAIN}`)
+      traefik.http.routers.qbittorrent.entrypoints: web
+      traefik.http.routers.qbittorrent.middlewares: auth@file
+      traefik.http.services.qbittorrent.loadBalancer.server.port: 9393
+      # ---
+      com.centurylinklabs.watchtower.enable: true
+      com.centurylinklabs.watchtower.scope: ${COMPOSE_PROJECT_NAME:-lab}
+
+  tautulli:
+    image: ghcr.io/tautulli/tautulli:latest
+    restart: unless-stopped
+    volumes:
+      - ${CONFIG_DIR}/tautulli:/config
+      - ${LOGS_DIR}/tautulli:/logs
+      - plex_logs:/plex-logs
+      - backups:/backups
+    environment:
+      TZ: ${TZ}
+      PUID: ${UID:-1000}
+      PGID: ${GID:-1000}
+    extra_hosts:
+      - plex:${NAS_IP:-127.0.0.1}
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "--show-error", "http://localhost:8181/status", "--header", "Accept: application/json"]
+    labels:
+      traefik.enable: true
+      traefik.http.routers.tautulli.rule: Host(`tautulli.${EXTERNAL_DOMAIN}`)
+      traefik.http.routers.tautulli.entrypoints: web
+      traefik.http.routers.tautulli.middlewares: auth@file
+      traefik.http.services.tautulli.loadBalancer.server.port: 8181
+      # ---
+      com.centurylinklabs.watchtower.enable: true
+      com.centurylinklabs.watchtower.scope: ${COMPOSE_PROJECT_NAME:-lab}
+
+  prowlarr:
+    image: ghcr.io/linuxserver/prowlarr:develop
+    restart: unless-stopped
+    network_mode: service:wireguard
+    volumes:
+      - ${CONFIG_DIR}/prowlarr:/config
+      - backups:/backups
+    environment:
+      TZ: ${TZ}
+      PUID: ${UID:-1000}
+      PGID: ${GID:-1000}
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "--show-error", "http://localhost:9696/ping", "--header", "Accept: application/json"]
+    labels:
+      traefik.enable: true
+      traefik.http.routers.prowlarr.rule: Host(`prowlarr.${EXTERNAL_DOMAIN}`)
+      traefik.http.routers.prowlarr.entrypoints: web
+      traefik.http.routers.prowlarr.middlewares: auth@file
+      traefik.http.services.prowlarr.loadBalancer.server.port: 9696
+      # ---
+      com.centurylinklabs.watchtower.enable: true
+      com.centurylinklabs.watchtower.scope: ${COMPOSE_PROJECT_NAME:-lab}
+
+  sonarr:
+    image: ghcr.io/linuxserver/sonarr:develop
+    restart: unless-stopped
+    network_mode: service:wireguard
+    volumes:
+      - ${CONFIG_DIR}/sonarr:/config
+      - media:/data
+      - backups:/backups
+    environment:
+      TZ: ${TZ}
+      PUID: ${UID:-1000}
+      PGID: ${GID:-1000}
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "--show-error", "http://localhost:8989/ping", "--header", "Accept: application/json"]
+    labels:
+      traefik.enable: true
+      traefik.http.routers.sonarr.rule: Host(`sonarr.${EXTERNAL_DOMAIN}`)
+      traefik.http.routers.sonarr.entrypoints: web
+      traefik.http.routers.sonarr.middlewares: auth@file
+      traefik.http.services.sonarr.loadBalancer.server.port: 8989
+      # ---
+      com.centurylinklabs.watchtower.enable: true
+      com.centurylinklabs.watchtower.scope: ${COMPOSE_PROJECT_NAME:-lab}
+
+  radarr:
+    image: ghcr.io/linuxserver/radarr:nightly
+    restart: unless-stopped
+    network_mode: service:wireguard
+    volumes:
+      - ${CONFIG_DIR}/radarr:/config
+      - media:/data
+      - backups:/backups
+    environment:
+      TZ: ${TZ}
+      PUID: ${UID:-1000}
+      PGID: ${GID:-1000}
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "--show-error", "http://localhost:7878/ping", "--header", "Accept: application/json"]
+    labels:
+      traefik.enable: true
+      traefik.http.routers.radarr.rule: Host(`radarr.${EXTERNAL_DOMAIN}`)
+      traefik.http.routers.radarr.entrypoints: web
+      traefik.http.routers.radarr.middlewares: auth@file
+      traefik.http.services.radarr.loadBalancer.server.port: 7878
+      # ---
+      com.centurylinklabs.watchtower.enable: true
+      com.centurylinklabs.watchtower.scope: ${COMPOSE_PROJECT_NAME:-lab}
+
+  bazarr:
+    image: ghcr.io/linuxserver/bazarr:development
+    restart: unless-stopped
+    network_mode: service:wireguard
+    volumes:
+      - ${CONFIG_DIR}/bazarr:/config
+      - media:/data
+      - backups:/backups
+    environment:
+      TZ: ${TZ}
+      PUID: ${UID:-1000}
+      PGID: ${GID:-1000}
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "--show-error", "http://localhost:6767"]
+    labels:
+      traefik.enable: true
+      traefik.http.routers.bazarr.rule: Host(`bazarr.${EXTERNAL_DOMAIN}`)
+      traefik.http.routers.bazarr.entrypoints: web
+      traefik.http.routers.bazarr.middlewares: auth@file
+      traefik.http.services.bazarr.loadBalancer.server.port: 6767
+      # ---
+      com.centurylinklabs.watchtower.enable: true
+      com.centurylinklabs.watchtower.scope: ${COMPOSE_PROJECT_NAME:-lab}
+
+  flaresolverr:
+    image: ghcr.io/flaresolverr/flaresolverr:latest
+    restart: unless-stopped
+    network_mode: service:wireguard
+    environment:
+      TZ: ${TZ}
+      CAPTCHA_SOLVER: none  # https://github.com/FlareSolverr/FlareSolverr#captcha-solvers
+      LOG_LEVEL: debug
+    healthcheck:
+      # pinging /health doesn't spam the log with 200 OKs.
+      # https://github.com/FlareSolverr/FlareSolverr/blob/master/src/flaresolverr.py#L40
+      test: ["CMD", "curl", "--fail", "--silent", "--show-error", "http://localhost:8191/health", "--header", "Accept: application/json"]
+    labels:
+      com.centurylinklabs.watchtower.enable: true
+      com.centurylinklabs.watchtower.scope: ${COMPOSE_PROJECT_NAME:-lab}
+
+  notifiarr:
+    image: docker.io/golift/notifiarr:latest
+    restart: unless-stopped
+    hostname: ${COMPOSE_PROJECT_NAME:-notifiarr}
+    user: ${UID:-1000}:${GID:-1000}
+    volumes:
+      - ${CONFIG_DIR}/notifiarr:/config
+      - ${LOGS_DIR}/notifiarr:/logs
+      - /etc/machine-id:/etc/machine-id:ro
+    environment:
+      TZ: ${TZ}
+      DN_API_KEY: ${NOTIFIARR_API_KEY}
+      # Authelia passes a username via this header, so we can safely bypass authentication
+      DN_UI_PASSWORD: "webauth:Remote-User"
+    extra_hosts:
+      # required for *arr apps to communicate with plex on a different machine
+      - plex:${NAS_IP:-127.0.0.1}
+      - homeassistant:${HOMEASSISTANT_IP:-127.0.0.1}
+    healthcheck:
+      test: ["CMD", "/image", "--ps"]
+    labels:
+      traefik.enable: true
+      traefik.http.routers.notifiarr.rule: Host(`notifiarr.${EXTERNAL_DOMAIN}`)
+      traefik.http.routers.notifiarr.entrypoints: web
+      traefik.http.routers.notifiarr.middlewares: auth@file
+      traefik.http.services.notifiarr.loadBalancer.server.port: 5454
+
+  gitea:
+    image: docker.io/gitea/gitea:latest
+    restart: unless-stopped
+    depends_on:
+      - gitea_db
+    volumes:
+      - ${CONFIG_DIR}/gitea/data:/data
+    environment:
+      TZ: ${TZ}
+      USER_UID: ${UID:-1000}
+      USER_GID: ${GID:-1000}
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "--show-error", "http://localhost:3000"]
+    labels:
+      traefik.enable: true
+      traefik.http.routers.gitea.rule: Host(`git.${EXTERNAL_DOMAIN}`)
+      traefik.http.routers.gitea.entrypoints: web
+      traefik.http.routers.gitea.middlewares: noauth@file
+      traefik.http.services.gitea.loadBalancer.server.port: 3000
+      # ---
+      com.centurylinklabs.watchtower.enable: true
+      com.centurylinklabs.watchtower.scope: ${COMPOSE_PROJECT_NAME:-lab}
+
+  gitea_db:
+    image: docker.io/postgres:16.1-alpine
+    restart: unless-stopped
+    user: ${UID:-1000}:${GID:-1000}
+    volumes:
+      - ${CONFIG_DIR}/gitea/db:/var/lib/postgresql/data
+    environment:
+      TZ: ${TZ}
+      POSTGRES_DB: gitea
+      POSTGRES_PASSWORD: gitea
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "postgres"]
+
+  minio:
+    image: docker.io/minio/minio:latest
+    restart: unless-stopped
+    command: ["server", "/data", "--console-address", ":9001"]
+    volumes:
+      - vault:/data
+    environment:
+      # MINIO_ROOT_USER: minioadmin
+      # MINIO_ROOT_PASSWORD: minioadmin
+      MINIO_SERVER_URL: https://vault.${EXTERNAL_DOMAIN}
+      MINIO_BROWSER_REDIRECT_URL: https://minio.${EXTERNAL_DOMAIN}
+    healthcheck:
+      # curl and wget were removed, see:
+      # https://github.com/minio/minio/commit/3aa3d9cf148ed8b3938fb466340d960a7a8d1f67
+      # https://github.com/minio/minio/issues/18389
+      test: ["CMD", "mc", "ready", "local"]
+      timeout: 10s
+    labels:
+      traefik.enable: true
+      # ---
+      # public
+      # ---
+      traefik.http.routers.vault.rule: Host(`vault.${EXTERNAL_DOMAIN}`)
+      traefik.http.routers.vault.entrypoints: web
+      # NOTE: WE DON'T WANT AUTHENTICATION ON THIS SUBDOMAIN!
+      traefik.http.routers.vault.middlewares: noauth@file
+      traefik.http.routers.vault.service: vault@docker
+      traefik.http.services.vault.loadBalancer.server.port: 9000
+      # ---
+      # admin console
+      # ---
+      traefik.http.routers.minio.rule: Host(`minio.${EXTERNAL_DOMAIN}`)
+      traefik.http.routers.minio.entrypoints: web
+      traefik.http.routers.minio.middlewares: noauth@file  # handled via Authelia OAuth
+      traefik.http.routers.minio.service: minio@docker
+      traefik.http.services.minio.loadBalancer.server.port: 9001
+      # ---
+      com.centurylinklabs.watchtower.enable: true
+      com.centurylinklabs.watchtower.scope: ${COMPOSE_PROJECT_NAME:-lab}
+
+  homepage:
+    image: ghcr.io/gethomepage/homepage:latest
+    restart: unless-stopped
+    volumes:
+      - ${CONFIG_DIR}/homepage:/app/config
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      TZ: ${TZ}
+      PUID: ${UID:-1000}
+      PGID: ${GID:-1000}
+      HOMEPAGE_VAR_EXTERNAL_DOMAIN: ${EXTERNAL_DOMAIN}
+    extra_hosts:
+      - plex:${NAS_IP:-127.0.0.1}
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--server-response", "http://localhost:3000/", "-O", "/dev/null"]
+    labels:
+      traefik.enable: true
+      traefik.http.routers.homepage.rule: Host(`home.${EXTERNAL_DOMAIN}`)
+      traefik.http.routers.homepage.entrypoints: web
+      traefik.http.routers.homepage.middlewares: auth@file
+      traefik.http.services.homepage.loadBalancer.server.port: 3000
+      # ---
+      com.centurylinklabs.watchtower.enable: true
+      com.centurylinklabs.watchtower.scope: ${COMPOSE_PROJECT_NAME:-lab}
+
+  munin:
+    image: docker.io/aheimsbakk/munin-alpine:latest
+    restart: unless-stopped
+    volumes:
+      - ${CONFIG_DIR}/munin/munin.conf:/etc/munin/munin.conf
+      - ${CONFIG_DIR}/munin/nginx.conf:/etc/nginx/nginx.conf
+      - ${CONFIG_DIR}/munin/lib:/var/lib/munin
+      - ${CONFIG_DIR}/munin/munin-conf.d:/etc/munin/munin-conf.d
+      - ${CONFIG_DIR}/munin/plugin-conf.d:/etc/munin/plugin-conf.d
+      - ${LOGS_DIR}/munin:/var/log/munin
+    environment:
+      TZ: ${TZ}
+    extra_hosts:
+      - host.docker.internal:host-gateway
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--server-response", "http://localhost/munin/", "-O", "/dev/null"]
+    labels:
+      traefik.enable: true
+      traefik.http.routers.munin.rule: Host(`lab.${EXTERNAL_DOMAIN}`) && (PathPrefix(`/munin`) || PathPrefix(`/munin-cgi`))
+      traefik.http.routers.munin.entrypoints: web
+      traefik.http.routers.munin.middlewares: auth@file
+      traefik.http.routers.munin.service: munin
+      traefik.http.services.munin.loadBalancer.server.port: 80
+      # ---
+      com.centurylinklabs.watchtower.enable: true
+      com.centurylinklabs.watchtower.scope: ${COMPOSE_PROJECT_NAME:-lab}
+
+  portainer_agent:
+    image: docker.io/portainer/agent:latest
+    restart: unless-stopped
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /var/lib/docker/volumes:/var/lib/docker/volumes
+    environment:
+      TZ: ${TZ}
+    labels:
+      com.centurylinklabs.watchtower.enable: true
+      com.centurylinklabs.watchtower.scope: ${COMPOSE_PROJECT_NAME:-lab}
+
+  portainer:
+    image: docker.io/portainer/portainer-ee:latest
+    restart: unless-stopped
+    command: -H tcp://portainer_agent:9001 --tlsskipverify
+    volumes:
+      - ${CONFIG_DIR}/portainer/data:/data
+    environment:
+      TZ: ${TZ}
+      VIRTUAL_HOST: portainer.${EXTERNAL_DOMAIN}
+    labels:
+      traefik.enable: true
+      traefik.http.routers.portainer.rule: Host(`portainer.${EXTERNAL_DOMAIN}`)
+      traefik.http.routers.portainer.entrypoints: web
+      traefik.http.routers.portainer.middlewares: noauth@file  # handled via Authelia OAuth
+      traefik.http.services.portainer.loadBalancer.server.port: 9000
+      # ---
+      com.centurylinklabs.watchtower.enable: true
+      com.centurylinklabs.watchtower.scope: ${COMPOSE_PROJECT_NAME:-lab}
+
+  dozzle:
+    image: docker.io/amir20/dozzle:master
+    restart: unless-stopped
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    environment:
+      TZ: ${TZ}
+      DOZZLE_BASE: /dozzle
+      DOZZLE_NO_ANALYTICS: true
+    healthcheck:
+      test: ["CMD", "/dozzle", "healthcheck"]
+    labels:
+      traefik.enable: true
+      traefik.http.routers.dozzle.rule: Host(`lab.${EXTERNAL_DOMAIN}`) && PathPrefix(`/dozzle`)
+      traefik.http.routers.dozzle.entrypoints: web
+      traefik.http.routers.dozzle.middlewares: auth@file
+      traefik.http.services.dozzle.loadBalancer.server.port: 8080
+      # ---
+      com.centurylinklabs.watchtower.enable: true
+      com.centurylinklabs.watchtower.scope: ${COMPOSE_PROJECT_NAME:-lab}
+
+  watchtower:
+    image: ghcr.io/containrrr/watchtower:latest
+    restart: unless-stopped
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      TZ: ${TZ}
+      WATCHTOWER_SCHEDULE: "0 15 3 * * *"  # every day at 3:15 AM EDT (note: cron syntax includes leading seconds)
+      WATCHTOWER_LABEL_ENABLE: true
+      WATCHTOWER_CLEANUP: true
+      WATCHTOWER_TIMEOUT: 60s
+      WATCHTOWER_SCOPE: ${COMPOSE_PROJECT_NAME:-lab}
+    labels:
+      com.centurylinklabs.watchtower.scope: ${COMPOSE_PROJECT_NAME:-lab}
+
+volumes:
+  media:
+    driver: local
+    driver_opts:
+      type: cifs
+      device: //${NAS_IP}/${MEDIA_SHARE}
+      o: "vers=3.0,rw,noperm,username=${SAMBA_USERNAME},password=${SAMBA_PASSWORD},iocharset=utf8"
+  downloads:
+    driver: local
+    driver_opts:
+      type: cifs
+      device: //${NAS_IP}/${MEDIA_SHARE}/Downloads
+      o: "vers=3.0,rw,noperm,username=${SAMBA_USERNAME},password=${SAMBA_PASSWORD},iocharset=utf8"
+  backups:
+    driver: local
+    driver_opts:
+      type: cifs
+      device: //${NAS_IP}/${DATA_SHARE}/backups
+      o: "vers=3.0,rw,noperm,username=${SAMBA_USERNAME},password=${SAMBA_PASSWORD},iocharset=utf8"
+  vault:
+    driver: local
+    driver_opts:
+      type: cifs
+      device: //${NAS_IP}/${DATA_SHARE}/data/minio
+      o: "vers=3.0,rw,noperm,username=${SAMBA_USERNAME},password=${SAMBA_PASSWORD},iocharset=utf8"
+  plex_logs:
+    driver: local
+    driver_opts:
+      type: cifs
+      device: //${NAS_IP}/PlexMediaServer/AppData/Plex Media Server/Logs
+      o: "vers=3.0,rw,noperm,username=${SAMBA_USERNAME},password=${SAMBA_PASSWORD},iocharset=utf8"
+
+secrets:
+  wg_private_key:
+    # replace the 'PrivateKey = ...' line under the '[Interface]' section in the given wireguard .conf file with the
+    # following line to read the private key from this docker secret instead:
+    #
+    #    PostUp = wg set %i private-key <(cat /run/secrets/wg_private_key)
+    #
+    # https://lists.zx2c4.com/pipermail/wireguard/2018-December/003702.html
+    file: ${SECRETS_DIR}/wireguard/privkey.txt
